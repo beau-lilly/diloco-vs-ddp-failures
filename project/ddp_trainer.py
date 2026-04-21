@@ -131,7 +131,14 @@ class DDPTrainer:
         self.total_steps_hint = sched.get("total_steps_hint", 20_000)
 
         self.checkpoint_interval = cfg["ddp"]["checkpoint_interval_seconds"]
-        self.checkpoint_dir = Path(cfg["ddp"]["checkpoint_dir"])
+        # Anchor checkpoints under runtime_dir so concurrent cells don't
+        # collide on the same rank0.pt. Config value is honored as an
+        # explicit override if set to an absolute path.
+        cfg_dir = Path(cfg["ddp"].get("checkpoint_dir", "checkpoints/ddp"))
+        if cfg_dir.is_absolute():
+            self.checkpoint_dir = cfg_dir
+        else:
+            self.checkpoint_dir = runtime_dir / "checkpoints" / "ddp"
         self.checkpoint_path = checkpoint_path or (self.checkpoint_dir / f"rank{rank}.pt")
         self._last_checkpoint_time: float | None = None
         self._tokens_this_rank = 0

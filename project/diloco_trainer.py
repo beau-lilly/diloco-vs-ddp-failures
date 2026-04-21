@@ -83,8 +83,14 @@ class DiLoCoTrainer:
 
         self.H = int(cfg["diloco"]["H"])
         d_cfg = cfg["diloco"]
-        self.outer_state_path = Path(d_cfg["outer_state_path"])
-        self.outer_state_dir = Path(d_cfg["outer_state_dir"])
+        # Anchor outer_state under runtime_dir so concurrent cells don't
+        # overwrite each other's θ_outer. Absolute config paths still win.
+        cfg_path = Path(d_cfg.get("outer_state_path", "checkpoints/diloco/outer_state.pt"))
+        if cfg_path.is_absolute():
+            self.outer_state_path = cfg_path
+        else:
+            self.outer_state_path = runtime_dir / "checkpoints" / "diloco" / "outer_state.pt"
+        self.outer_state_dir = self.outer_state_path.parent
         self.outer_state_write_every = int(d_cfg.get("outer_state_write_every", 1))
 
         # Persistent outer optimizer — its Nesterov buffer must survive the whole run.
