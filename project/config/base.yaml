@@ -1,0 +1,47 @@
+# Shared hyperparameters for both DDP and DiLoCo.
+# Fields here are merged under framework-specific overrides.
+
+model:
+  n_layer: 12
+  n_head: 12
+  n_embd: 768
+  block_size: 512
+  vocab_size: 50257
+  dropout: 0.0
+  bias: false
+
+data:
+  tokenizer: gpt2
+  context_length: 512
+  # Per-worker batch size. Calibrated once on the target hardware then frozen.
+  # Set to fit one GPU at ctx=512 on a 4-GPU A10 VM. Placeholder — update
+  # after Lambda calibration; see experiment-matrix.md.
+  per_worker_batch_size: 16
+  tinystories_train: data_cache/tinystories_train.bin
+  tinystories_val: data_cache/tinystories_val.bin
+  eval_batches: 16
+
+train:
+  target_loss: 2.0
+  max_wall_clock_seconds: 10800      # 3 hours; indicator only, not a cutoff
+  eval_every_seconds: 30
+  progress_publish_hz: 1.0
+  grad_clip: 1.0
+
+# Crash thresholds are set after Group A completes (0.25/0.5/0.75 × T_baseline).
+# For dry runs, a small placeholder list can be passed via --crash-schedule.
+crash:
+  replacement_delay_seconds: 30
+  nccl_timeout_seconds: 120
+
+straggler:
+  p_per_minute: 0.15
+  slow_duration_min_seconds: 30
+  slow_duration_max_seconds: 90
+  slowdown_factor: 3.0
+  expected_run_minutes: 180
+
+wandb:
+  project: diloco-vs-ddp-failures
+  entity: null                       # set per-user
+  mode: online                       # overridden to "offline" for smoke tests

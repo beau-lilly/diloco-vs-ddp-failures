@@ -1,0 +1,27 @@
+framework: diloco
+
+# Inner AdamW — fresh each outer step
+inner_optimizer:
+  name: adamw
+  lr: 3.0e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  cosine_decay: true
+  warmup_steps: 200
+  min_lr_mult: 0.1
+
+# Outer SGD+Nesterov — persistent buffer, constant LR
+outer_optimizer:
+  name: sgd_nesterov
+  lr: 0.7
+  momentum: 0.9
+
+diloco:
+  H: 50                              # overridden by --H CLI arg
+  outer_state_path: checkpoints/diloco/outer_state.pt
+  outer_state_dir: checkpoints/diloco
+  # Write outer_state.pt every K outer steps (see implementation-notes.md I/O note).
+  # K=1 is safe but expensive at small H; set to 1 for correctness and bump if
+  # profiling shows it's non-trivial.
+  outer_state_write_every: 1

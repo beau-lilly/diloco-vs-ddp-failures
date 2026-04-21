@@ -1,0 +1,17 @@
+framework: ddp
+
+optimizer:
+  name: adamw
+  lr: 3.0e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+
+schedule:
+  warmup_steps: 200
+  cosine_decay: true
+  min_lr_mult: 0.1
+
+ddp:
+  checkpoint_interval_seconds: 300   # 5 minutes, per algorithm-notes.md
+  checkpoint_dir: checkpoints/ddp

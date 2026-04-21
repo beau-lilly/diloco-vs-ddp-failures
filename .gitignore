@@ -1,0 +1,10 @@
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+project/runtime/
+project/checkpoints/
+project/data_cache/
+/tmp/
+plots/
+wandb/
