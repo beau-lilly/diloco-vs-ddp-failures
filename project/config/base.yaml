@@ -13,10 +13,12 @@ model:
 data:
   tokenizer: gpt2
   context_length: 512
-  # Per-worker batch size. Calibrated once on the target hardware then frozen.
-  # Set to fit one GPU at ctx=512 on a 4-GPU A10 VM. Placeholder — update
-  # after Lambda calibration; see experiment-matrix.md.
-  per_worker_batch_size: 16
+  # Per-worker batch size. Calibrated on the Lambda 8xA100 (40 GB SXM4):
+  # 64 OOMs, 32 fits at ~27 GB/40 GB, 48 fits at ~39 GB (too tight). Locked
+  # at 32. Do NOT edit via sed on the Lambda box — a `git pull` will reset
+  # any uncommitted change and the subsequent runs will quietly run at the
+  # wrong batch size (happened once during the H=500 crash retries).
+  per_worker_batch_size: 32
   tinystories_train: data_cache/tinystories_train.bin
   tinystories_val: data_cache/tinystories_val.bin
   eval_batches: 16
