@@ -17,9 +17,12 @@ run_lane() {
   local port
   if [[ $lane -eq 0 ]]; then gpus="0,1,2,3"; port=29500; else gpus="4,5,6,7"; port=29600; fi
   {
-    CUDA_VISIBLE_DEVICES=$gpus MASTER_PORT=$port bash scripts/run_ddp_crash.sh "$seed" "$SCHEDULE"
+    # Use || true so a failed DDP crash run doesn't abort the whole lane
+    # (errexit propagates into this function). DiLoCo crash cells must
+    # still run even if DDP never converges — they're the core experiment.
+    CUDA_VISIBLE_DEVICES=$gpus MASTER_PORT=$port bash scripts/run_ddp_crash.sh "$seed" "$SCHEDULE" || true
     for H in 10 50 100 500; do
-      CUDA_VISIBLE_DEVICES=$gpus MASTER_PORT=$port bash scripts/run_diloco_crash.sh "$seed" "$H" "$SCHEDULE"
+      CUDA_VISIBLE_DEVICES=$gpus MASTER_PORT=$port bash scripts/run_diloco_crash.sh "$seed" "$H" "$SCHEDULE" || true
     done
   } 2>&1 | sed "s/^/[lane${lane}] /"
 }

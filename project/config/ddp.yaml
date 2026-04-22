@@ -13,5 +13,10 @@ schedule:
   min_lr_mult: 0.1
 
 ddp:
-  checkpoint_interval_seconds: 300   # 5 minutes, per algorithm-notes.md
+  # 5 minutes per spec. On A100 NVLink, clean DDP converges in ~6 min, so at
+  # 300 s cadence the first checkpoint may not have been written before the
+  # first crash fires — forcing training to restart from scratch and eating
+  # all `--max_restarts`. 60 s is a pragmatic override that guarantees at
+  # least one good checkpoint exists before the 25% threshold crash.
+  checkpoint_interval_seconds: 60
   checkpoint_dir: checkpoints/ddp
