@@ -26,7 +26,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from checkpoint import load_ddp_checkpoint, restore_rng, save_ddp_checkpoint
 from control_plane import ProgressAggregator, RankTokenFile
-from metrics import Metrics
+from metrics import CrashEventRecord, Metrics
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +91,8 @@ class DDPTrainer:
         runtime_dir: Path,
         straggler_injector=None,
         checkpoint_path: Path | None = None,
+        crash_schedule: list[int] | None = None,
+        crash_seed: int = 0,
     ):
         self.rank = rank
         self.world_size = world_size
@@ -142,6 +144,19 @@ class DDPTrainer:
         self.checkpoint_path = checkpoint_path or (self.checkpoint_dir / f"rank{rank}.pt")
         self._last_checkpoint_time: float | None = None
         self._tokens_this_rank = 0
+
+        # Virtual-crash state. When crash_schedule is non-empty, the trainer
+        # fires in-process crash events at each token threshold: every rank
+        # sleeps for replacement_delay_seconds (simulating the "wait for a new
+        # worker" cost), then every rank reloads the last checkpoint (the
+        # authentic DDP rollback). No SIGKILL, no NCCL teardown.
+        import random as _random
+        self._crash_schedule = list(crash_schedule or [])
+        self._crash_idx = 0
+        self._crash_rng = _random.Random(crash_seed * 99991 + 13)
+        self._crash_replacement_delay = cfg.get("crash", {}).get(
+            "replacement_delay_seconds", 30.0
+        )
 
         # Token transport
         self.rank_tokens = RankTokenFile(runtime_dir, rank)
@@ -222,6 +237,88 @@ class DDPTrainer:
     def _should_eval(self, last_eval_at: float) -> bool:
         return (self.metrics.wall_clock_elapsed() - last_eval_at) >= self.cfg["train"]["eval_every_seconds"]
 
+    def _maybe_virtual_crash(self) -> None:
+        """In-process virtual crash for DDP runs.
+
+        Rank 0 is authoritative: it decides whether tokens_raw has crossed the
+        next threshold, picks a victim, and broadcasts a 2-element tensor
+        [should_crash, victim_rank] to all ranks. Every rank then:
+          1. Records a CrashEventRecord with lost_tokens = tokens_raw - tokens_committed
+          2. Sleeps `replacement_delay_seconds` (simulating pod re-scheduling)
+          3. Reloads the last DDP checkpoint (the authentic full-cluster
+             rollback; work since the last checkpoint is lost)
+          4. Rewinds tokens_raw to tokens_committed (per measurement-plan.md)
+
+        No SIGKILL, no NCCL teardown, no torchrun restarts. Deterministic.
+        """
+        if not self._crash_schedule:
+            return
+        flags = torch.zeros(2, device=self.device)
+        if self.rank == 0:
+            if (
+                self._crash_idx < len(self._crash_schedule)
+                and self.metrics.tokens_raw >= self._crash_schedule[self._crash_idx]
+            ):
+                flags[0] = 1.0
+                flags[1] = float(self._crash_rng.randrange(self.world_size))
+        dist.broadcast(flags, src=0)
+        if flags[0].item() <= 0:
+            return
+
+        victim_rank = int(flags[1].item())
+        lost = self.metrics.tokens_raw - self.metrics.tokens_committed
+        event = CrashEventRecord(
+            event_tokens_raw=self.metrics.tokens_raw,
+            event_tokens_committed=self.metrics.tokens_committed,
+            wall_clock_seconds=self.metrics.wall_clock_elapsed(),
+            victim_rank=victim_rank,
+            lost_tokens=lost,
+        )
+        self.metrics.crashes.append(event)
+        self.logger.log_failure(
+            event_type="crash",
+            event_time=event.wall_clock_seconds,
+            event_tokens=event.event_tokens_raw,
+            victim_rank=victim_rank,
+            lost_tokens=lost,
+        )
+
+        # 1. Wait for "replacement." This is the 30 s the spec charges every
+        #    crash in the wall-clock budget. All ranks sleep together so the
+        #    process group isn't disturbed.
+        time.sleep(self._crash_replacement_delay)
+
+        # 2. Roll back. Every rank reloads the last checkpoint state in-place.
+        #    If no checkpoint exists yet (early first-crash edge case), just
+        #    reset counters.
+        if self.checkpoint_path.exists():
+            state = load_ddp_checkpoint(self.checkpoint_path)
+            self.model.module.load_state_dict(state["model"])
+            self.optimizer.load_state_dict(state["optimizer"])
+            restore_rng(state)
+            self.metrics.tokens_raw = state["tokens_raw"]
+            self.metrics.tokens_committed = state["tokens_committed"]
+            self.metrics.step = state["step"]
+            self._tokens_this_rank = state["tokens_raw"] // self.world_size
+            self.dataloader.set_position(state["dataloader_position"])
+        else:
+            # No checkpoint yet — full rewind to start.
+            self.metrics.tokens_raw = 0
+            self.metrics.tokens_committed = 0
+            self.metrics.step = 0
+            self._tokens_this_rank = 0
+        self.rank_tokens.publish(self._tokens_this_rank)
+        if self.progress_agg is not None:
+            self.progress_agg.set_committed(self.metrics.tokens_committed)
+
+        self._crash_idx += 1
+        if self.rank == 0:
+            print(
+                f"[ddp] virtual crash #{self._crash_idx}: victim={victim_rank}, "
+                f"lost_tokens={lost:,}, rewound to tokens={self.metrics.tokens_raw:,}",
+                flush=True,
+            )
+
     def _evaluate(self) -> float:
         self.model.eval()
         losses = []
@@ -269,6 +366,10 @@ class DDPTrainer:
 
             if self.straggler is not None:
                 self.straggler.step_hook(step_compute)
+
+            # Virtual crash (in-process). Rank 0 is authoritative and
+            # broadcasts so every rank agrees.
+            self._maybe_virtual_crash()
 
             if self.rank == 0 and self.metrics.step % 50 == 0:
                 self.logger.log({

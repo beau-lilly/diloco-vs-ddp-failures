@@ -90,6 +90,11 @@ def parse_args():
                     help="override target loss in smoke mode (e.g. 0.1 to keep training)")
     ap.add_argument("--smoke-max-wall-clock", type=float, default=None,
                     help="override max wall-clock seconds in smoke mode")
+    ap.add_argument("--crash-schedule", default=None,
+                    help="comma-separated token thresholds for in-process virtual "
+                         "crashes (e.g. '6684672,13369344,20054016'). When set, each "
+                         "trainer fires a virtual crash at each threshold instead of "
+                         "waiting for an out-of-process sidecar to SIGKILL a worker.")
     return ap.parse_args()
 
 
@@ -186,6 +191,11 @@ def main():
     if args.control_filestore is not None:
         control_store = DiLoCoControlStore(Path(args.control_filestore), world_size=world_size)
 
+    # Parse virtual-crash schedule
+    crash_schedule = []
+    if args.crash_schedule:
+        crash_schedule = [int(t) for t in args.crash_schedule.split(",") if t.strip()]
+
     if args.framework == "ddp":
         from ddp_trainer import DDPTrainer
         trainer = DDPTrainer(
@@ -200,6 +210,8 @@ def main():
             device=device,
             runtime_dir=runtime_dir,
             straggler_injector=straggler,
+            crash_schedule=crash_schedule,
+            crash_seed=args.seed,
         )
     else:
         from diloco_trainer import DiLoCoTrainer
@@ -218,6 +230,8 @@ def main():
             control_store=control_store,
             is_rejoining=args.rejoin,
             rejoin_crash_epoch=args.crash_epoch,
+            crash_schedule=crash_schedule,
+            crash_seed=args.seed,
         )
 
     try:

@@ -7,19 +7,12 @@ set -euo pipefail
 : "${PROJECT_ROOT:=$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$PROJECT_ROOT"
 
-# Spec says 3 crashes at {0.25, 0.5, 0.75} of T_baseline. At our measured
-# clean time of ~356 s, 3 crashes collapse to ~88 s apart — shorter than
-# NCCL's DDP recovery cycle (~90-120 s: 30 s replacement delay + NCCL
-# timeout + rdzv + DDP init collective). Cascaded crashes land during
-# prior recovery and kill workers unrecoverably.
-#
-# Rescue: 2 crashes at {0.50, 0.85} of T_baseline. ~125 s apart, safely
-# outside the NCCL recovery cycle. Still gives the DiLoCo-vs-DDP story
-# two data points per run (rollback happens twice for DDP) rather than
-# one, so the writeup can still argue "DiLoCo shrugs off repeated
-# incidents, DDP eats cascading rollbacks."
-SCHEDULE="$(python3 -c "t=int('$T_BASELINE'); print(','.join(str(int(t*f)) for f in (0.5, 0.85)))")"
-echo "[parallel-group-b] crash thresholds (2 crashes at 50%/85% of T_baseline): $SCHEDULE"
+# Virtual-crash design: the trainers themselves fire the crash events
+# in-process (no SIGKILL, no torchrun restart cascade), so the NCCL
+# recovery timing that forced us away from the spec-faithful {25, 50, 75}%
+# schedule no longer applies. Back to spec values.
+SCHEDULE="$(python3 -c "t=int('$T_BASELINE'); print(','.join(str(int(t*f)) for f in (0.25, 0.5, 0.75)))")"
+echo "[parallel-group-b] crash thresholds (3 crashes at 25%/50%/75% of T_baseline): $SCHEDULE"
 
 run_lane() {
   local lane=$1

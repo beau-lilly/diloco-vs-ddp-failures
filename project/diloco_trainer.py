@@ -36,7 +36,7 @@ import torch.nn as nn
 
 from checkpoint import load_outer_state, load_rank_cursor, save_outer_state, save_rank_cursor
 from control_plane import DiLoCoControlStore, ProgressAggregator, RankTokenFile
-from metrics import Metrics
+from metrics import CrashEventRecord, Metrics
 
 
 def _cosine_inner_lr(step: int, base_lr: float, warmup: int, total_steps_hint: int, min_lr_mult: float) -> float:
@@ -67,6 +67,8 @@ class DiLoCoTrainer:
         control_store: DiLoCoControlStore | None = None,
         is_rejoining: bool = False,
         rejoin_crash_epoch: int = 0,
+        crash_schedule: list[int] | None = None,
+        crash_seed: int = 0,
     ):
         self.rank = rank
         self.world_size = world_size
@@ -125,10 +127,21 @@ class DiLoCoTrainer:
         # successful outer step. Used by the replacement on rejoin.
         self.rank_cursor_path = runtime_dir / f"diloco_cursor.{rank}.pt"
 
-        # Rejoin bookkeeping
+        # Rejoin bookkeeping (SIGKILL-based path, retained for CPU smoke).
         self._rejoining_this_outer_step = is_rejoining
         self._pending_rejoin_epoch = rejoin_crash_epoch
         self._handled_crash_epochs: set[int] = set()
+
+        # Virtual-crash state (in-process simulated crashes for Group B).
+        import random as _random
+        self._crash_schedule = list(crash_schedule or [])
+        self._crash_idx = 0
+        self._crash_rng = _random.Random(crash_seed * 99991 + 13)
+        self._crash_replacement_delay = cfg.get("crash", {}).get(
+            "replacement_delay_seconds", 30.0
+        )
+        # Per-outer-step virtual-crash state, set by _maybe_virtual_crash_outer.
+        self._virtual_victim_this_outer_step: int | None = None
 
         # If we're a replacement, load outer_state and this rank's committed cursor
         if is_rejoining:
@@ -317,15 +330,30 @@ class DiLoCoTrainer:
     # One outer step — inner loop + pseudo-gradient all-reduce + SGD+Nesterov
     # ------------------------------------------------------------------
     def _do_outer_step(self) -> float:
+        # Decide whether THIS outer step is a virtual-crash step. Rank 0 is
+        # authoritative; broadcasts [crash_now, victim] so all ranks agree.
+        self._maybe_virtual_crash_outer()
+
         # Snapshot θ_outer — the state the outer optimizer owns.
         theta_outer = {name: p.detach().clone() for name, p in self.model.named_parameters()}
 
-        if self._rejoining_this_outer_step:
-            # Replacement's first post-rejoin outer step: skip inner loop.
-            # Live params remain θ_outer, so Δ_local = 0 below.
+        am_victim = (
+            self._virtual_victim_this_outer_step is not None
+            and self._virtual_victim_this_outer_step == self.rank
+        )
+
+        if self._rejoining_this_outer_step or am_victim:
+            # Either a replacement's first post-rejoin step (SIGKILL path) or
+            # the victim of a virtual crash (in-process path): skip inner
+            # loop. Live params remain θ_outer, so Δ_local = 0 below.
             last_loss = float("nan")
         else:
             last_loss = self._run_inner_loop(theta_outer)
+
+        # If this was a virtual-crash step, all ranks pause to simulate the
+        # "wait for replacement" idle time. Charged to wall-clock.
+        if self._virtual_victim_this_outer_step is not None:
+            time.sleep(self._crash_replacement_delay)
 
         # Gate any collective on rejoin_pending — this is the load-bearing
         # race guard (spec step 6 / pitfall #10). Survivors check the control
@@ -385,7 +413,72 @@ class DiLoCoTrainer:
         # After the first post-rejoin outer step, the replacement behaves like
         # any other worker.
         self._rejoining_this_outer_step = False
+        # Clear the virtual-crash victim flag so the next outer step starts
+        # from a clean state.
+        self._virtual_victim_this_outer_step = None
         return last_loss
+
+    def _maybe_virtual_crash_outer(self) -> None:
+        """In-process virtual crash for DiLoCo runs.
+
+        Rank 0 authoritatively checks whether the cluster's tokens_raw has
+        crossed the next crash threshold. If yes, it picks a victim rank
+        and broadcasts [crash_now, victim_rank] to all ranks. Every rank
+        then records a CrashEventRecord; the victim additionally skips its
+        inner loop for this outer step (live params stay = θ_outer, so its
+        Δ = 0 in the outer all-reduce). All ranks pause for
+        replacement_delay_seconds just before the outer collective to
+        simulate "waiting for replacement," which is the real idle cost.
+        """
+        if not self._crash_schedule:
+            self._virtual_victim_this_outer_step = None
+            return
+        flags = torch.zeros(2, device=self.device)
+        if self.rank == 0:
+            tokens_raw_now = self._get_tokens_raw()
+            if (
+                self._crash_idx < len(self._crash_schedule)
+                and tokens_raw_now >= self._crash_schedule[self._crash_idx]
+            ):
+                flags[0] = 1.0
+                flags[1] = float(self._crash_rng.randrange(self.world_size))
+        dist.broadcast(flags, src=0)
+        if flags[0].item() <= 0:
+            self._virtual_victim_this_outer_step = None
+            return
+
+        victim_rank = int(flags[1].item())
+        self._virtual_victim_this_outer_step = victim_rank
+
+        # Lost tokens = victim's work it will NOT do this outer step, bounded
+        # by H × per-worker batch × ctx. This matches the spec's "≤ 1 worker
+        # × H inner steps" bound from algorithm-notes.md.
+        per_step_tokens = (
+            self.cfg["data"]["per_worker_batch_size"] * self.cfg["data"]["context_length"]
+        )
+        lost = self.H * per_step_tokens
+        event = CrashEventRecord(
+            event_tokens_raw=self._get_tokens_raw(),
+            event_tokens_committed=self.metrics.tokens_committed,
+            wall_clock_seconds=self.metrics.wall_clock_elapsed(),
+            victim_rank=victim_rank,
+            lost_tokens=lost,
+        )
+        self.metrics.crashes.append(event)
+        self.logger.log_failure(
+            event_type="crash",
+            event_time=event.wall_clock_seconds,
+            event_tokens=event.event_tokens_raw,
+            victim_rank=victim_rank,
+            lost_tokens=lost,
+        )
+        self._crash_idx += 1
+        if self.rank == 0:
+            print(
+                f"[diloco] virtual crash #{self._crash_idx}: victim={victim_rank}, "
+                f"lost_tokens≤{lost:,} (victim skips H={self.H} inner steps)",
+                flush=True,
+            )
 
     # ------------------------------------------------------------------
     def _evaluate(self) -> float:
