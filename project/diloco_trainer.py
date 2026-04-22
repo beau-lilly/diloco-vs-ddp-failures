@@ -416,6 +416,14 @@ class DiLoCoTrainer:
         # Clear the virtual-crash victim flag so the next outer step starts
         # from a clean state.
         self._virtual_victim_this_outer_step = None
+
+        # Defragment the CUDA caching allocator between outer steps. At large
+        # H (e.g. 500) the inner-loop's 500 AdamW steps accumulate transient
+        # allocations that can slow subsequent outer steps enough to trip the
+        # NCCL timeout on crash runs. Empty_cache is cheap (~ms) and purely
+        # a performance hint.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return last_loss
 
     def _maybe_virtual_crash_outer(self) -> None:

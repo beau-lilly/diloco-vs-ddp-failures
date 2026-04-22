@@ -34,7 +34,10 @@ train:
 # For dry runs, a small placeholder list can be passed via --crash-schedule.
 crash:
   replacement_delay_seconds: 30
-  nccl_timeout_seconds: 120
+  # 900 s is a generous safety margin for H=500 runs where outer steps are
+  # long (500 inner + crash sleep). Hitting 120 s during H=500 crash runs
+  # was the observed failure mode.
+  nccl_timeout_seconds: 900
 
 straggler:
   p_per_minute: 0.15
