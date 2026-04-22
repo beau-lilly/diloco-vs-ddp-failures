@@ -24,10 +24,9 @@ data:
 train:
   target_loss: 2.5
   max_wall_clock_seconds: 10800      # 3 hours; indicator only, not a cutoff
-  # 10 s eval cadence — dense enough that even short runs (H=10 ~10 min) get
-  # 60+ eval points and H=500 runs get ~90+. Makes the eval/loss curves
-  # presentation-ready regardless of H or crash count. Overhead is ~5%.
-  eval_every_seconds: 10
+  # 30 s cadence: ~12 dots on 6-min DDP runs, ~30 dots on 15-min H=500 runs.
+  # Earlier "single-dot H=500" observation was runs dying early, not cadence.
+  eval_every_seconds: 30
   progress_publish_hz: 1.0
   grad_clip: 1.0
 
